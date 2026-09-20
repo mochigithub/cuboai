@@ -4,7 +4,7 @@ import logging.handlers
 
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 
@@ -470,6 +470,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.debug("go2rtc manager started.")
 
     hass.data[DOMAIN][entry.entry_id]["go2rtc"] = go2rtc_manager
+
+    # A normal HA stop/restart does NOT call async_unload_entry (only reload
+    # or removal does), so without this listener the watchdog task started
+    # above outlives the "final write" shutdown stage — HA logs a stage-
+    # timeout warning for it, which can stall the Supervisor's
+    # home_assistant_core job on add-on installs.
+    async def _async_stop_go2rtc(_event) -> None:
+        await go2rtc_manager.stop()
+
+    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_go2rtc))
 
     # Register update listener to reload when options change
     entry.async_on_unload(entry.add_update_listener(async_update_options))
