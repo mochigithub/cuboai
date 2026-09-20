@@ -19,6 +19,7 @@ Every test names the mutation it kills.
 
 import asyncio
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -542,6 +543,65 @@ async def test_the_options_form_offers_the_notification_toggle():
     keys = {str(k): k for k in result["data_schema"].schema}
     assert OPT_NOTIFY_ON_RESTART in keys, f"toggle missing from the options form: {sorted(keys)}"
     assert keys[OPT_NOTIFY_ON_RESTART].default() is True, "the toggle must default to ON"
+
+
+# =============================================================================
+# HA shutdown must stop the watchdog too
+# =============================================================================
+#
+# async_unload_entry (which calls go2rtc_manager.stop()) only runs on a
+# reload or removal of the config entry — NOT on a normal HA stop/restart.
+# Without a EVENT_HOMEASSISTANT_STOP listener the watchdog task started by
+# async_setup_entry outlives the "final write" shutdown stage: HA logs a
+# stage-timeout warning for it, and on add-on installs that can stall the
+# Supervisor's home_assistant_core job. This is a source pin, like
+# test_backfill_source_pins in test_duplicate_account.py: driving the real
+# async_setup_entry needs the whole HA runtime, so what matters here is that
+# the listener exists, is torn down with the entry, and is wired to stop()
+# the SAME manager instance start() armed.
+
+
+def test_a_stop_event_listener_is_registered_for_every_entry():
+    """Kill: the EVENT_HOMEASSISTANT_STOP listener removed from async_setup_entry."""
+    src = Path("custom_components/cuboai/__init__.py").read_text(encoding="utf-8")
+    assert "EVENT_HOMEASSISTANT_STOP" in src
+    assert "hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP" in src
+    # Registered via async_on_unload so a reload does not stack a second
+    # listener, and so it is removed the same way the update listener is.
+    assert "entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP" in " ".join(src.split())
+
+
+def test_the_stop_listener_stops_the_go2rtc_manager_started_by_this_entry():
+    """Kill: the listener wired to a stale/unrelated manager instead of the
+    `go2rtc_manager` variable `start()` was just called on."""
+    src = Path("custom_components/cuboai/__init__.py").read_text(encoding="utf-8")
+    flat = " ".join(src.split())
+    assert "await go2rtc_manager.stop()" in flat
+    # The listener must be defined and registered AFTER go2rtc_manager exists
+    # and started, and before the function returns. (The import line's
+    # EVENT_HOMEASSISTANT_STOP mention is not the registration.)
+    assert src.index("await go2rtc_manager.start()") < src.index(
+        "hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP"
+    )
+
+
+def test_the_stop_listener_is_registered_before_the_function_returns():
+    """Kill: the registration moved past `return True`, or omitted."""
+    src = Path("custom_components/cuboai/__init__.py").read_text(encoding="utf-8")
+    setup_start = src.index("async def async_setup_entry")
+    setup_end = src.index("async def async_update_options")
+    body = src[setup_start:setup_end]
+    assert "EVENT_HOMEASSISTANT_STOP" in body
+    assert "hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP" in body
+
+
+def test_the_stop_listener_is_imported_from_homeassistant_const():
+    """Kill: a locally-invented stop-event name that never matches the real
+    event HA fires, silently defeating the whole fix."""
+    src = Path("custom_components/cuboai/__init__.py").read_text(encoding="utf-8")
+    assert "from homeassistant.const import" in src
+    import_line = next(line for line in src.splitlines() if line.startswith("from homeassistant.const import"))
+    assert "EVENT_HOMEASSISTANT_STOP" in import_line
 
 
 def test_the_toggle_is_labelled_in_both_string_files():
