@@ -33,7 +33,8 @@ TICK = 0.01
 
 
 def _make_hass():
-    """A hass whose async_create_task really schedules the coroutine.
+    """A hass whose async_create_task/async_create_background_task really
+    schedule the coroutine.
 
     conftest stubs `homeassistant` as a MagicMock, so the default
     `hass.async_create_task(coro)` would return a MagicMock and silently never
@@ -47,6 +48,7 @@ def _make_hass():
 
     hass.async_add_executor_job = AsyncMock(side_effect=_run)
     hass.async_create_task = lambda coro, *a, **kw: asyncio.get_running_loop().create_task(coro)
+    hass.async_create_background_task = lambda coro, *a, **kw: asyncio.get_running_loop().create_task(coro)
     return hass
 
 
