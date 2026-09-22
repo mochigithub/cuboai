@@ -889,7 +889,9 @@ class Go2RTCManager:
     def _start_watchdog(self) -> None:
         """(Re)arm the supervisor task for the current process."""
         self._cancel_watchdog()
-        self._watchdog_task = self.hass.async_create_task(self._watchdog())
+        self._watchdog_task = self.hass.async_create_background_task(
+            self._watchdog(), name="cuboai_go2rtc_watchdog"
+        )
 
     def _cancel_watchdog(self) -> None:
         """Disarm the supervisor.
