@@ -5,7 +5,7 @@ from homeassistant.components.camera import Camera
 from homeassistant.core import callback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, effective_ports, live_stream_name
+from .const import DOMAIN, effective_ports, live_stream_name, ports_changed_signal
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -390,6 +390,38 @@ class CuboLocalCamera(CoordinatorEntity, Camera):
             _LOGGER.debug("Warm-hold of %s released", name)
         except asyncio.CancelledError:
             pass
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        from homeassistant.helpers.dispatcher import async_dispatcher_connect
+
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                ports_changed_signal(self.coordinator.config_entry.entry_id),
+                self._on_ports_changed,
+            )
+        )
+
+    @callback
+    def _on_ports_changed(self) -> None:
+        self.hass.async_create_task(self._async_repoint_stream())
+
+    async def _async_repoint_stream(self) -> None:
+        """Move an existing HA Stream to the new go2rtc URL.
+
+        Camera.async_create_stream() calls stream_source() only once, when the
+        Stream is first created; its worker then retries that frozen URL for the
+        life of the entity. After go2rtc hops ports (8557 -> 8558) the worker
+        would keep dialing the dead port, so hand it the fresh URL here."""
+        stream = self.stream
+        if stream is None:
+            return
+        source = await self.stream_source()
+        if source is None or source == stream.source:
+            return
+        _LOGGER.info("go2rtc ports changed — repointing the %s stream worker", self._device_id)
+        stream.update_source(source)
 
     async def async_will_remove_from_hass(self) -> None:
         """Drop the warm-hold consumer on removal/reload so go2rtc can reap."""
