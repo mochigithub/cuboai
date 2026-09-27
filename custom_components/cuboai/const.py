@@ -22,6 +22,11 @@ OPT_NOTIFY_ON_RESTART = "notify_on_engine_restart"
 NOTIFY_ON_RESTART_DEFAULT = True
 
 
+def ports_changed_signal(entry_id) -> str:
+    """Dispatcher signal fired after an entry's go2rtc (re)binds its ports."""
+    return f"cuboai_ports_changed_{entry_id}"
+
+
 def effective_ports(hass, entry_id, rtsp_default: int = 8555) -> tuple[int, int]:
     """The (rtsp, api) ports go2rtc ACTUALLY bound, for ONE config entry.
 

@@ -9,7 +9,7 @@ import time
 import yaml
 from homeassistant.core import HomeAssistant
 
-from .const import DESIRED_API_PORT, DOMAIN, NOTIFY_ON_RESTART_DEFAULT, OPT_NOTIFY_ON_RESTART
+from .const import DESIRED_API_PORT, DOMAIN, NOTIFY_ON_RESTART_DEFAULT, OPT_NOTIFY_ON_RESTART, ports_changed_signal
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -618,6 +618,14 @@ class Go2RTCManager:
             }
         domain_data["rtsp_port_effective"] = rtsp_port
         domain_data["api_port_effective"] = api_port
+        # HA's Stream object freezes the URL stream_source() returned when it
+        # was created and its worker retries THAT URL forever — reading
+        # rtsp_port_effective is not enough once a stream exists. Tell the
+        # cameras so they can repoint it (observed live: after an 8557 -> 8558
+        # hop the stream worker kept dialing 8557 for days).
+        from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+        async_dispatcher_send(self.hass, ports_changed_signal(self._entry_id))
         await self._sync_webrtc_integration_url(api_port)
         return rtsp_port, webrtc_port
 
@@ -889,7 +897,9 @@ class Go2RTCManager:
     def _start_watchdog(self) -> None:
         """(Re)arm the supervisor task for the current process."""
         self._cancel_watchdog()
-        self._watchdog_task = self.hass.async_create_task(self._watchdog())
+        self._watchdog_task = self.hass.async_create_background_task(
+            self._watchdog(), name="cuboai_go2rtc_watchdog"
+        )
 
     def _cancel_watchdog(self) -> None:
         """Disarm the supervisor.
