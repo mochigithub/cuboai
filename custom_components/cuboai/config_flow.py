@@ -6,7 +6,32 @@ from homeassistant import config_entries
 from homeassistant.core import callback
 
 from .api import cuboai_functions as api
-from .const import DOMAIN, NOTIFY_ON_RESTART_DEFAULT, OPT_NOTIFY_ON_RESTART, effective_ports
+from .const import (
+    DESIRED_ONVIF_PORT,
+    DOMAIN,
+    H264_ENCODERS,
+    H264_RESOLUTIONS,
+    NOTIFY_ON_RESTART_DEFAULT,
+    OPT_H264_ENCODER,
+    OPT_H264_RESOLUTION,
+    OPT_NOTIFY_ON_RESTART,
+    OPT_PROTECT_CAMERA,
+    OPT_PROTECT_CAMERAS,
+    OPT_PROTECT_ENABLED,
+    OPT_PROTECT_PASSWORD,
+    OPT_PROTECT_PORT,
+    OPT_PROTECT_PORTS,
+    OPT_PROTECT_USERNAME,
+    OPT_VAAPI_DEVICE,
+    PROTECT_USERNAME_DEFAULT,
+    assign_protect_ports,
+    effective_onvif_ports,
+    effective_ports,
+    h264_encoder,
+    h264_resolution,
+    protect_camera_id,
+    protect_camera_ids,
+)
 
 # Dedicated file logger for CuboAI
 _LOGGER = logging.getLogger(__name__)
@@ -56,8 +81,174 @@ def generate_random_user_agent():
     return random.choice(options)
 
 
+def _protect_schema(options: dict, cameras: list[dict], full: bool) -> dict:
+    """The UniFi Protect fields. `full` adds the camera picker and the port
+    (Configure); the first-run step keeps to the switch and the credentials."""
+    import homeassistant.helpers.config_validation as cv
+
+    schema = {
+        vol.Optional(OPT_PROTECT_ENABLED, default=options.get(OPT_PROTECT_ENABLED, False)): bool,
+    }
+    if full and cameras:
+        choices = {c["device_id"]: f"{c.get('baby_name', 'Camera')} ({c['device_id']})" for c in cameras}
+        schema[vol.Optional(OPT_PROTECT_CAMERAS, default=protect_camera_ids(options, cameras))] = cv.multi_select(
+            choices
+        )
+    schema[vol.Optional(OPT_PROTECT_USERNAME, default=options.get(OPT_PROTECT_USERNAME, PROTECT_USERNAME_DEFAULT))] = (
+        str
+    )
+    # suggested_value, not default: with a default, a cleared field could never
+    # be saved (the same reason as nvr_password).
+    schema[
+        vol.Optional(OPT_PROTECT_PASSWORD, description={"suggested_value": options.get(OPT_PROTECT_PASSWORD, "")})
+    ] = str
+    if full:
+        schema[vol.Optional(OPT_PROTECT_PORT, default=int(options.get(OPT_PROTECT_PORT, DESIRED_ONVIF_PORT)))] = (
+            vol.All(vol.Coerce(int), vol.Range(min=1024, max=65535))
+        )
+    return schema
+
+
+def _recorded_primary(previous: dict, merged: dict, cameras: list[dict]):
+    """The camera that keeps the host's real MAC on the base port, recorded
+    once and then never moved (const.protect_primary_id).
+
+    Already recorded: kept. A v2.6.37–2.6.40 install that had Protect on keeps
+    the camera those versions exposed (the one Protect adopted with that MAC).
+    Otherwise the first camera now exposed.
+    """
+    if previous.get(OPT_PROTECT_CAMERA) is not None:
+        return previous[OPT_PROTECT_CAMERA]
+    if previous.get(OPT_PROTECT_ENABLED) and OPT_PROTECT_CAMERAS not in previous:
+        return protect_camera_id(previous, cameras)
+    exposed = protect_camera_ids(merged, cameras)
+    return exposed[0] if exposed else None
+
+
+async def _protect_plan(hass, previous: dict, user_input: dict, cameras: list[dict], entry_id: str | None):
+    """Validate the UniFi Protect fields and work out what to store.
+
+    Returns (errors, stored): `stored` holds the recorded primary camera and
+    the {camera: port} map, to be saved with the options (the options flow
+    replaces ALL options, so bookkeeping not written here would be lost).
+    """
+    errors: dict = {}
+    merged = {**previous, **user_input}
+    stored = {
+        OPT_PROTECT_CAMERA: _recorded_primary(previous, merged, cameras),
+        OPT_PROTECT_PORTS: dict(previous.get(OPT_PROTECT_PORTS) or {}),
+    }
+    if not user_input.get(OPT_PROTECT_ENABLED):
+        return errors, stored
+    # Protect refuses to adopt a camera with an empty password.
+    if not (user_input.get(OPT_PROTECT_PASSWORD) or "").strip():
+        errors[OPT_PROTECT_PASSWORD] = "unifi_password_required"
+    if OPT_PROTECT_CAMERAS in user_input and not user_input[OPT_PROTECT_CAMERAS]:
+        errors[OPT_PROTECT_CAMERAS] = "unifi_protect_no_camera"
+    # The base port and the MACs are per HOST: the primary camera of a second
+    # CuboAI account would report the same MAC and Protect would merge them.
+    others = [
+        e
+        for e in hass.config_entries.async_entries(DOMAIN)
+        if e.entry_id != entry_id and (e.options or {}).get(OPT_PROTECT_ENABLED)
+    ]
+    if others:
+        errors["base"] = "unifi_protect_other_entry"
+
+    from .go2rtc import _port_bindable
+
+    merged[OPT_PROTECT_CAMERA] = stored[OPT_PROTECT_CAMERA]
+    held = set(effective_onvif_ports(hass, entry_id).values()) if entry_id else set()
+    rtsp = user_input.get("rtsp_port")
+    avoid = {int(rtsp)} if rtsp is not None else set()
+    saved = {d: int(p) for d, p in (previous.get(OPT_PROTECT_PORTS) or {}).items()}
+    try:
+        base = int(merged.get(OPT_PROTECT_PORT) or DESIRED_ONVIF_PORT)
+    except (TypeError, ValueError):
+        base = DESIRED_ONVIF_PORT
+    field = OPT_PROTECT_PORT if OPT_PROTECT_PORT in user_input else "base"
+    if base in avoid:
+        errors[field] = "onvif_port_in_use"
+        return errors, stored
+    # A camera that already has a port keeps it (Protect adopted ip:port); a
+    # camera getting its first port skips any that cannot be bound.
+    for _ in range(50):
+        ports = assign_protect_ports(merged, cameras, avoid=avoid)
+        retry = False
+        for dev, port in ports.items():
+            if port in held or await hass.async_add_executor_job(_port_bindable, port):
+                continue
+            if port == base:
+                errors[field] = "onvif_port_in_use"
+            elif saved.get(dev) == port:
+                errors[OPT_PROTECT_CAMERAS if OPT_PROTECT_CAMERAS in user_input else "base"] = (
+                    "onvif_camera_port_in_use"
+                )
+            else:
+                avoid.add(port)
+                retry = True
+        if not retry:
+            break
+    stored[OPT_PROTECT_PORTS] = {**stored[OPT_PROTECT_PORTS], **ports}
+    return errors, stored
+
+
 class CuboAIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
+    _reauth_entry = None
+
+    async def async_step_reauth(self, entry_data):
+        """Recover the existing account without recreating cameras or entities."""
+        # context["entry_id"], not _get_reauth_entry(): that helper (and
+        # async_update_reload_and_abort's data_updates) only exist from HA
+        # 2024.11, and hacs.json still declares 2024.1.
+        self._reauth_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(self, user_input=None):
+        """Reuse the password/MFA login, with a session-recovery explanation."""
+        return await self.async_step_user(user_input)
+
+    def _finish_reauth(self, uuid, username, data, user_agent):
+        """Replace only authentication data after verifying the account."""
+        entry = self._reauth_entry
+        expected_uuid = entry.data.get("uuid")
+        if expected_uuid:
+            same_account = str(uuid) == str(expected_uuid)
+        else:
+            expected_username = str(entry.data.get("username", "")).strip().lower()
+            same_account = bool(expected_username) and username.strip().lower() == expected_username
+        if not same_account:
+            return self.async_abort(reason="wrong_account")
+        if not data.get("access_token") or not data.get("refresh_token"):
+            raise ValueError("Incomplete CuboAI login response")
+        self.hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                "uuid": uuid,
+                "username": username,
+                "access_token": data["access_token"],
+                "refresh_token": data["refresh_token"],
+                "user_agent": user_agent,
+            },
+        )
+        # Only auth keys changed, which the update listener deliberately ignores,
+        # so the reload is ours: it starts a failed entry or restarts a running
+        # one on the new session.
+        self.hass.async_create_task(self.hass.config_entries.async_reload(entry.entry_id))
+        return self.async_abort(reason="reauth_successful")
+
+    def _auth_schema(self):
+        """The sign-in form; a re-sign-in pre-fills the account it must match."""
+        if self._reauth_entry is None:
+            return AUTH_SCHEMA
+        return vol.Schema(
+            {
+                vol.Required("username", default=self._reauth_entry.data.get("username", "")): str,
+                vol.Required("password"): str,
+            }
+        )
 
     async def async_step_user(self, user_input=None):
         setup_file_logger(self.hass)
@@ -116,8 +307,8 @@ class CuboAIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 access_token = data["access_token"]
                 refresh_token = data["refresh_token"]
 
-                _LOGGER.debug("Access token (first 20 chars): %s...", access_token[:20])
-                _LOGGER.debug("Refresh token (first 20 chars): %s...", refresh_token[:20])
+                if self._reauth_entry is not None:
+                    return self._finish_reauth(uuid, user_input["username"], data, user_agent)
 
                 # Fetch all cameras
                 device_map = await self.hass.async_add_executor_job(api.get_camera_profiles, access_token, user_agent)
@@ -125,7 +316,11 @@ class CuboAIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 if not device_map:
                     _LOGGER.error("No cameras found for account")
                     errors["base"] = "no_cameras"
-                    return self.async_show_form(step_id="user", data_schema=AUTH_SCHEMA, errors=errors)
+                    return self.async_show_form(
+                        step_id="reauth_confirm" if self._reauth_entry is not None else "user",
+                        data_schema=self._auth_schema(),
+                        errors=errors,
+                    )
 
                 # Store all cameras for setup
                 cameras = device_map
@@ -163,7 +358,11 @@ class CuboAIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     _LOGGER.exception("CuboAI authentication failed: %s", e)
                     errors["base"] = "auth_failed"
 
-        return self.async_show_form(step_id="user", data_schema=AUTH_SCHEMA, errors=errors)
+        return self.async_show_form(
+            step_id="reauth_confirm" if self._reauth_entry is not None else "user",
+            data_schema=self._auth_schema(),
+            errors=errors,
+        )
 
     async def async_step_mfa(self, user_input=None):
         """Handle MFA code input step."""
@@ -199,8 +398,8 @@ class CuboAIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 access_token = data["access_token"]
                 refresh_token = data["refresh_token"]
 
-                _LOGGER.debug("Access token (first 20 chars): %s...", access_token[:20])
-                _LOGGER.debug("Refresh token (first 20 chars): %s...", refresh_token[:20])
+                if self._reauth_entry is not None:
+                    return self._finish_reauth(uuid, self._username_input, data, self._user_agent)
 
                 # Fetch all cameras
                 device_map = await self.hass.async_add_executor_job(
@@ -304,17 +503,25 @@ class CuboAIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_config(self, user_input=None):
         """Handle configuration options step."""
         setup_file_logger(self.hass)
+        errors = {}
         if user_input is not None:
-            return self.async_create_entry(
-                title=f"CuboAI ({self._auth_data['username']})",
-                data=self._auth_data,
-                options=user_input,
-            )
+            errors, stored = await _protect_plan(self.hass, {}, user_input, self._auth_data.get("cameras", []), None)
+            if not errors:
+                user_input.update(stored)
+                user_input[OPT_PROTECT_PASSWORD] = user_input.get(OPT_PROTECT_PASSWORD) or ""
+                return self.async_create_entry(
+                    title=f"CuboAI ({self._auth_data['username']})",
+                    data=self._auth_data,
+                    options=user_input,
+                )
 
         from .utils import find_available_port
 
-        # Binds sockets to probe ports — keep it off the event loop.
-        default_port = await self.hass.async_add_executor_job(find_available_port)
+        # Binds sockets to probe ports — keep it off the event loop. Re-shown
+        # after an error, the user's own port stays in the field.
+        default_port = (user_input or {}).get("rtsp_port") or await self.hass.async_add_executor_job(
+            find_available_port
+        )
 
         schema = {
             vol.Required("download_images", default=True): bool,
@@ -332,9 +539,14 @@ class CuboAIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             key = f"camera_ip_{dev_id}"
             schema[vol.Optional(key, description={"suggested_value": ""})] = str
 
+        # UniFi Protect: the switch and the credentials here; which camera and
+        # which port live in Configure (sensible defaults until then).
+        schema.update(_protect_schema(user_input or {}, self._auth_data.get("cameras", []), full=False))
+
         return self.async_show_form(
             step_id="config",
             data_schema=vol.Schema(schema),
+            errors=errors,
             description_placeholders={"docs_url": DOCS_DEBUG_URL},
         )
 
@@ -349,10 +561,27 @@ class CuboAIOptionsFlowHandler(config_entries.OptionsFlow):
         super().__init__()
         # self.config_entry is provided automatically by the base OptionsFlow class
 
+    def _cameras_after(self, user_input: dict) -> list[dict]:
+        """The cameras the entry will have once this form is saved (the camera
+        picker in the same form can add or remove some)."""
+        selected = user_input.get("cameras")
+        if selected is None:
+            return list(self.config_entry.data.get("cameras", []))
+        all_cams = self.config_entry.data.get("all_cameras") or self.config_entry.data.get("cameras", [])
+        return [c for c in all_cams if c["device_id"] in selected]
+
     async def async_step_init(self, user_input=None):
         setup_file_logger(self.hass)
+        from .go2rtc import vaapi_devices
+
+        devices = await self.hass.async_add_executor_job(vaapi_devices)
         errors = {}
         if user_input is not None:
+            if user_input.get(OPT_H264_ENCODER) == "vaapi":
+                if not devices:
+                    errors[OPT_H264_ENCODER] = "vaapi_unavailable"
+                elif user_input.get(OPT_VAAPI_DEVICE) not in devices:
+                    errors[OPT_VAAPI_DEVICE] = "vaapi_device_unavailable"
             # Validate a manually chosen RTSP port BEFORE saving: it is valid
             # if it's the port our own go2rtc currently holds, or if it can
             # actually be bound. Otherwise reject with a clear error instead
@@ -367,8 +596,19 @@ class CuboAIOptionsFlowHandler(config_entries.OptionsFlow):
 
                 if not await self.hass.async_add_executor_job(_port_bindable, chosen_port):
                     errors["rtsp_port"] = "rtsp_port_in_use"
+            protect_errors, protect_stored = await _protect_plan(
+                self.hass,
+                dict(self.config_entry.options),
+                user_input,
+                self._cameras_after(user_input),
+                self.config_entry.entry_id,
+            )
+            errors.update(protect_errors)
 
         if user_input is not None and not errors:
+            user_input.setdefault(OPT_H264_ENCODER, "software")
+            if OPT_VAAPI_DEVICE in self.config_entry.options:
+                user_input.setdefault(OPT_VAAPI_DEVICE, self.config_entry.options[OPT_VAAPI_DEVICE])
             # Camera selection is stored in entry DATA (it defines which devices
             # exist), the rest are regular options.
             selected = user_input.pop("cameras", None)
@@ -388,6 +628,8 @@ class CuboAIOptionsFlowHandler(config_entries.OptionsFlow):
             # suggested_value note in the schema) — store it explicitly as ""
             # so the old password can't survive anywhere downstream.
             user_input["nvr_password"] = user_input.get("nvr_password") or ""
+            user_input[OPT_PROTECT_PASSWORD] = user_input.get(OPT_PROTECT_PASSWORD) or ""
+            user_input.update(protect_stored)
 
             # The YouTube/Spotify cache is owned by the Cache YouTube Songs
             # switch entity (single source of truth, restored across restarts);
@@ -517,6 +759,22 @@ class CuboAIOptionsFlowHandler(config_entries.OptionsFlow):
         schema[vol.Optional("h264_cameras", default=self.config_entry.options.get("h264_cameras", []))] = (
             cv.multi_select(h264_options)
         )
+        # How big that transcode is. 720p for a machine that cannot convert
+        # 1080p in real time (#85: a Raspberry Pi 4 managed 0.53-0.66x).
+        schema[
+            vol.Optional(
+                OPT_H264_RESOLUTION,
+                default=h264_resolution(self.config_entry.options),
+            )
+        ] = vol.In(list(H264_RESOLUTIONS))
+        encoders = H264_ENCODERS if devices else {"software": H264_ENCODERS["software"]}
+        device = self.config_entry.options.get(OPT_VAAPI_DEVICE)
+        encoder = h264_encoder(self.config_entry.options) if device in devices else "software"
+        schema[vol.Optional(OPT_H264_ENCODER, default=encoder)] = vol.In(encoders)
+        if devices:
+            schema[vol.Optional(OPT_VAAPI_DEVICE, default=device if device in devices else devices[0])] = vol.In(
+                devices
+            )
 
         # Burn the wall-clock time into the RTSP video image for the checked
         # cameras, so an NVR's recordings show when each frame was captured.
@@ -530,6 +788,10 @@ class CuboAIOptionsFlowHandler(config_entries.OptionsFlow):
                 default=self.config_entry.options.get("rtsp_timestamp_cameras", []),
             )
         ] = cv.multi_select(h264_options)
+
+        # UniFi Protect: present ONE camera as a third-party ONVIF camera
+        # (onvif_server.py). Last in the form, as its own section.
+        schema.update(_protect_schema(dict(self.config_entry.options), cameras, full=True))
 
         return self.async_show_form(
             step_id="init",

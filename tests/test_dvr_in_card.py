@@ -12,11 +12,12 @@ Two things have to hold for that, and both are guarded here:
   identifies a CuboAI camera by its entity id instead, and this entity has the
   same naming problem: no ``_attr_has_entity_name``, so the id is
   ``camera.<baby>_recording`` with no ``cuboai_`` anywhere in it.
-- nothing re-applies the live config while a recording is playing. FOUR call
-  sites push the live entity back into the child, and any one of them would
-  drop the viewer back to now mid-scrub. This test found the fourth: the first
-  build of this feature guarded three and missed the one that creates the
-  picture, which fires when a dashboard is navigated away from and back.
+- nothing re-applies the live config while a recording is playing. THREE call
+  sites push the live entity back into the child (four until the mic tap
+  stopped reconfiguring the video), and any one of them would drop the viewer
+  back to now mid-scrub. This test once found the fourth: the first build of
+  this feature guarded three and missed the one that creates the picture,
+  which fires when a dashboard is navigated away from and back.
 """
 
 import json
@@ -66,7 +67,7 @@ CARD = Path(__file__).parent.parent / "custom_components" / "cuboai" / "www" / "
 
 def _make_recording():
     coordinator = MagicMock()
-    rec = camera_platform.CuboRecordingCamera(coordinator, {"device_id": "DEV1", "baby_name": "Mia"})
+    rec = camera_platform.CuboRecordingCamera(coordinator, {"device_id": "DEV1", "baby_name": "Zuzu"})
     rec.hass = MagicMock()
     rec.async_write_ha_state = MagicMock()
     return rec
@@ -170,10 +171,12 @@ class TestCardKeepsPlaybackInPlace:
         unguarded ends playback the moment the config is touched."""
         lines = _card_code().splitlines()
         sites = [i for i, line in enumerate(lines) if "this.content.setConfig(webrtcConfig)" in line]
-        assert len(sites) == 4, f"call sites moved: {sites}"
+        # Three: the mic tap used to be a fourth, and no longer touches the
+        # video at all (two-way audio has its own path over HA's websocket).
+        assert len(sites) == 3, f"call sites moved: {sites}"
         for i in sites:
-            # The guard sits on the call line or just above it -- two of these
-            # retarget the config, two skip the call outright.
+            # The guard sits on the call line or just above it -- one of these
+            # retargets the config, two skip the call outright.
             window = "\n".join(lines[max(0, i - 3) : i + 1])
             assert "_dvrPlaying" in window, lines[i]
 
@@ -353,7 +356,7 @@ def test_recording_matcher(tmp_path):
     harness = tmp_path / "h.js"
     harness.write_text(_HARNESS, encoding="utf-8")
 
-    one = {"camera.mia_local_camera": _live("DEV1"), "camera.mia_recording": _rec("DEV1")}
+    one = {"camera.zuzu_local_camera": _live("DEV1"), "camera.zuzu_recording": _rec("DEV1")}
     two = dict(
         one,
         **{
@@ -373,7 +376,7 @@ def test_recording_matcher(tmp_path):
         # One camera and no pin: unambiguous.
         {"hass": {"states": one}, "deviceId": None},
         # The live camera must never be mistaken for the recording one.
-        {"hass": {"states": {"camera.mia_local_camera": _live("DEV1")}}, "deviceId": "DEV1"},
+        {"hass": {"states": {"camera.zuzu_local_camera": _live("DEV1")}}, "deviceId": "DEV1"},
         # An install that has not been reloaded yet.
         {"hass": {"states": {}}, "deviceId": "DEV1"},
         {"hass": None, "deviceId": "DEV1"},
@@ -390,11 +393,11 @@ def test_recording_matcher(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
     assert json.loads(proc.stdout) == [
-        "camera.mia_recording",
+        "camera.zuzu_recording",
         "camera.zzz",
         "camera.leo_recording",
         None,
-        "camera.mia_recording",
+        "camera.zuzu_recording",
         None,
         None,
         None,

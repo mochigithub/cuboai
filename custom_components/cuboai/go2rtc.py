@@ -1,17 +1,206 @@
 import asyncio
+import glob
 import logging
 import os
+import re
 import shutil
 import socket
+import stat
+import subprocess
 import sys
 import time
 
 import yaml
 from homeassistant.core import HomeAssistant
 
-from .const import DESIRED_API_PORT, DOMAIN, NOTIFY_ON_RESTART_DEFAULT, OPT_NOTIFY_ON_RESTART, ports_changed_signal
+from .const import (
+    DESIRED_API_PORT,
+    DOMAIN,
+    H264_KEYINT,
+    H264_RESOLUTIONS,
+    NOTIFY_ON_RESTART_DEFAULT,
+    OPT_NOTIFY_ON_RESTART,
+    OPT_PROTECT_ENABLED,
+    OPT_VAAPI_DEVICE,
+    VAAPI_DEVICE_PATTERN,
+    h264_encoder,
+    h264_resolution,
+    ports_changed_signal,
+    protect_camera_ids,
+    protect_stream_name,
+    protect_stream_target,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+# ── every camera frame once ───────────────────────────────────────────────────
+#
+# go2rtc's transcodes write to its RTSP server, and ffmpeg's RTSP muxer is
+# constant-frame-rate: ffmpeg pads the output up to the frame rate it GUESSED
+# for the input by repeating frames. A Cubo 3's HEVC is guessed at 29.92 fps
+# while the camera sends 15, so more than half of what libx264 encoded were
+# repeats (#85: dup=604 of 1120 frames, on a Raspberry Pi 4 that then fell to
+# 0.66x real time). Passthrough encodes each camera frame exactly once.
+FPS_MODE_PASSTHROUGH = "-fps_mode passthrough"
+#: The same for ffmpeg before 5.1, which has no -fps_mode (-vsync is deprecated
+#: in later versions but still accepted by 8.1).
+VSYNC_PASSTHROUGH = "-vsync passthrough"
+_FPS_FLAG: str | None = None
+#: dump_extra: SPS/PPS in front of every keyframe, see h264_transcode_args (#85).
+VAAPI_H264_ARGS = f"-c:v h264_vaapi -g {H264_KEYINT} -bf 0 -profile:v high -level:v 4.0 -sei:v 0 -bsf:v dump_extra"
+
+
+def vaapi_dimensions(resolution: str) -> tuple[str, str]:
+    """Return bounded, aspect-preserving VAAPI dimensions."""
+    width, height = H264_RESOLUTIONS[resolution]
+    return (
+        f"'min({width},iw)'",
+        f"'min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+    )
+
+
+def _render_device_ok(device) -> bool:
+    """A Linux render node (`/dev/dri/renderD<n>`) this process can read and write."""
+    try:
+        return bool(
+            isinstance(device, str)
+            and re.fullmatch(VAAPI_DEVICE_PATTERN, device)
+            and stat.S_ISCHR(os.stat(device).st_mode)
+            and os.access(device, os.R_OK | os.W_OK)
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def vaapi_devices() -> list[str]:
+    """List accessible Linux render nodes."""
+    if sys.platform != "linux":
+        return []
+    try:
+        candidates = glob.glob("/dev/dri/renderD*")
+    except OSError:
+        return []
+    devices = [device for device in candidates if _render_device_ok(device)]
+    return sorted(devices, key=lambda device: int(device.rsplit("renderD", 1)[1]))
+
+
+#: (device, resolution) pairs whose encoding test passed in this Home Assistant
+#: run. The test spawns ffmpeg (up to 10 s) and ran on EVERY engine start --
+#: Home Assistant startup awaits that start, and so does each watchdog restart.
+#: Only a pass is remembered: a failure is retried at the next start, so fixing
+#: the driver or the container needs a reload, not a restart. The cheap device
+#: check still runs every time, so a GPU that disappeared falls back at once.
+_VAAPI_PASSED: set[tuple[str, str]] = set()
+
+
+def vaapi_filters(resolution: str) -> str:
+    """The -vf chain go2rtc 1.9.14 builds for `#hardware=vaapi` + `#width/#height`
+    on an h264 output (internal/ffmpeg/hardware: InsertFilter + fixPixelFormat),
+    so the startup test exercises the same filters the live stream runs."""
+    width, height = vaapi_dimensions(resolution)
+    return f"format=vaapi|nv12,hwupload,scale_vaapi={width}:{height}:out_color_matrix=bt709:out_range=tv:format=nv12"
+
+
+def _probe_vaapi(device: str, resolution: str) -> bool:
+    """Whether VAAPI can scale and encode on `device`; blocking (see _VAAPI_PASSED)."""
+    if sys.platform != "linux" or not _render_device_ok(device):
+        return False
+    if (device, resolution) in _VAAPI_PASSED:
+        return True
+    if _vaapi_encode_test(device, resolution):
+        _VAAPI_PASSED.add((device, resolution))
+        return True
+    return False
+
+
+def _vaapi_encode_test(device: str, resolution: str) -> bool:
+    """Scale and encode one synthetic frame through VAAPI. Blocking, <= 10 s."""
+    filters = vaapi_filters(resolution)
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-vaapi_device",
+                device,
+                "-f",
+                "lavfi",
+                "-i",
+                "color=size=128x128:rate=1",
+                "-vf",
+                filters,
+                "-frames:v",
+                "1",
+                *VAAPI_H264_ARGS.split(),
+                "-f",
+                "null",
+                "-",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def fps_passthrough_flag(version_text: str) -> str:
+    """`ffmpeg -version` output -> the option that keeps every frame exactly once.
+
+    A version that cannot be read (a git build says `N-12345-g…`) is taken as
+    current: -fps_mode exists since 5.1, and 5.1 is older than any ffmpeg that
+    Home Assistant 2024.1 (this integration's minimum) ships in its images.
+    """
+    m = re.search(r"ffmpeg version n?(\d+)\.(\d+)", version_text or "")
+    if m and (int(m.group(1)), int(m.group(2))) < (5, 1):
+        return VSYNC_PASSTHROUGH
+    return FPS_MODE_PASSTHROUGH
+
+
+def _ffmpeg_version_text() -> str:
+    """The `ffmpeg -version` banner of the ffmpeg go2rtc runs, or "". Blocking."""
+    try:
+        return subprocess.run(
+            ["ffmpeg", "-hide_banner", "-version"], capture_output=True, text=True, timeout=10, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def h264_transcode_args(options, fps_flag: str = FPS_MODE_PASSTHROUGH) -> str:
+    """The raw ffmpeg arguments of the `cuboai_h264_<id>` transcode (issue #85).
+
+    * every camera frame once (see FPS_MODE_PASSTHROUGH);
+    * at most the configured size, keeping the aspect ratio: scale=min(...)
+      with force_original_aspect_ratio=decrease only ever SHRINKS, so a source
+      already within the cap is untouched. HomeKit cameras top out at
+      1920x1080 (~level 4.0); a Cubo 3 (SW05) streams 2560x1440, and HomeKit
+      silently refused that ("No Response");
+    * H.264 High, level 4.0, a keyframe every H264_KEYINT frames. go2rtc's
+      template names its own -level:v and -g, which win over the same options
+      given here (they come later on the command line), so both are set
+      through -x264-params, which libx264 applies last (ffprobe: High / 4.0);
+    * SPS/PPS repeated in front of every keyframe (repeat-headers=1). ffmpeg
+      sets the global-header flag for its RTSP output into go2rtc, so libx264
+      otherwise sends them ONLY in the SDP. HomeKit copies the video into RTP
+      for the Apple device, which never sees that SDP, so it got keyframes it
+      could not decode: a full session and still "No Response" (#85, measured
+      2026-10-22 on go2rtc 1.9.14 + ffmpeg 8.1.2: 0 of 7 keyframes carried
+      SPS/PPS; with repeat-headers=1 every one did -- as the camera's own
+      H.264 does, which is why a Cubo 2 played and the transcode did not).
+    """
+    width, height = H264_RESOLUTIONS[h264_resolution(options)]
+    return (
+        f"{fps_flag} "
+        f"-vf scale='min({width},iw)':'min({height},ih)':force_original_aspect_ratio=decrease"
+        f" -profile:v high -x264-params level=4.0:keyint={H264_KEYINT}:repeat-headers=1"
+    )
+
 
 # ── go2rtc process watchdog ───────────────────────────────────────────────────
 #
@@ -93,6 +282,7 @@ class Go2RTCManager:
         self._streams = {}
         self._cameras = []
         self._options = {}
+        self._vaapi_enabled = False
         # Watchdog state. `_started_at` is monotonic (wall clock can step under
         # NTP and would make a long healthy run look instantaneous).
         self._watchdog_task: asyncio.Task | None = None
@@ -105,8 +295,41 @@ class Go2RTCManager:
         self._options = options or {}
         self._streams = {}
 
+    async def _fps_passthrough_flag(self) -> str:
+        """FPS_MODE_PASSTHROUGH, or VSYNC_PASSTHROUGH for an ffmpeg older than 5.1.
+
+        Asked once per Home Assistant run, and only when a camera transcodes.
+        If ffmpeg cannot be asked, the current option is assumed.
+        """
+        global _FPS_FLAG
+        if _FPS_FLAG is None:
+            try:
+                text = await self.hass.async_add_executor_job(_ffmpeg_version_text)
+            except Exception:  # noqa: BLE001 - a version probe must never stop the streams
+                text = ""
+            _FPS_FLAG = fps_passthrough_flag(text if isinstance(text, str) else "")
+            _LOGGER.debug("H.264 transcode frame option: %s", _FPS_FLAG)
+        return _FPS_FLAG
+
     async def _resolve_codecs(self):
         """Resolve video codecs for all cameras asynchronously."""
+        self._vaapi_enabled = False
+        if h264_encoder(self._options) == "vaapi" and any(
+            camera.get("device_id") in (self._options.get("h264_cameras") or []) for camera in self._cameras
+        ):
+            try:
+                self._vaapi_enabled = await self.hass.async_add_executor_job(
+                    _probe_vaapi,
+                    self._options.get(OPT_VAAPI_DEVICE, ""),
+                    h264_resolution(self._options),
+                )
+            except Exception:
+                self._vaapi_enabled = False
+            if not self._vaapi_enabled:
+                _LOGGER.warning(
+                    "VAAPI H.264 preflight failed; using software encoding. Check the render device, "
+                    "container permissions, FFmpeg and VAAPI driver."
+                )
         script_dir = os.path.join(os.path.dirname(__file__), "tutk")
         video_script = os.path.join(script_dir, "cuboai_stream_video.py")
         debug_logs = bool(self._options.get("enable_debug_logs"))
@@ -154,10 +377,12 @@ class Go2RTCManager:
             # INFO with debug logs on so it shows without touching HA's logger
             # config; DEBUG otherwise.
             (_LOGGER.info if debug_logs else _LOGGER.debug)(
-                "go2rtc stream plan for %s: video=%s (h264_transcode %s, option h264_cameras=%s), audio=opus+aac",
+                "go2rtc stream plan for %s: video=%s (h264_transcode %s, size %s, option h264_cameras=%s), "
+                "audio=opus+aac",
                 dev_id,
                 video_codec,
                 "ON" if force_h264 else "off",
+                h264_resolution(self._options),
                 self._options.get("h264_cameras") or [],
             )
 
@@ -255,28 +480,26 @@ class Go2RTCManager:
             #      ~10s cold start plus the up-to-one-GOP wait for a decodable
             #      keyframe instead of dying into a 404.
             if force_h264:
-                # Cap at 1080p / H.264 High level 4.0 for HomeKit (and HLS).
-                # HomeKit cameras top out at 1920x1080 (~level 4.0); a Cubo 3
-                # (SW05) HEVC sensor streams 2560x1440, so this transcode was
-                # emitting 1440p High level ~5.0. HomeKit then sets up a full
-                # SRTP session and SILENTLY refuses the out-of-spec video — a
-                # valid session with nothing on screen, i.e. "No Response"
-                # (issue #85, after the v2.6.18 producer fix). scale=min(...)
-                # with force_original_aspect_ratio=decrease only shrinks a
-                # source ABOVE 1080p, so a native-1080p camera (Cubo 2 / CB02)
-                # is byte-for-byte unaffected. This is the COMPATIBILITY stream
-                # (that is why it exists); full-resolution recording of a 1440p
+                # The COMPATIBILITY stream (that is why it exists): HomeKit-safe
+                # H.264 at most 1080p (or 720p, the option), every camera frame
+                # once, a keyframe every H264_KEYINT frames — see
+                # h264_transcode_args. Full-resolution recording of a 1440p
                 # camera should point its NVR at the native combined stream,
-                # which stays untouched. Verified on go2rtc 1.9.14: the plain
-                # -level:v arg is overridden by go2rtc's template, so the level
-                # is pinned via -x264-params (ffprobe out: High / level 4.0).
-                hk = (
-                    "-vf scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease"
-                    " -profile:v high -x264-params level=4.0"
-                )
-                self._streams[f"cuboai_h264_{dev_id}"] = [
-                    f"ffmpeg:cuboai_combined_{dev_id}#video=h264#audio=aac#timeout=20#raw={hk}",
-                ]
+                # which stays untouched. Verified on go2rtc 1.9.14 + ffmpeg
+                # 8.1.2 (a private go2rtc on a live camera): go2rtc puts these
+                # arguments BEFORE its own template on the ffmpeg command line.
+                fps_flag = await self._fps_passthrough_flag()
+                if self._vaapi_enabled:
+                    width, height = vaapi_dimensions(h264_resolution(self._options))
+                    self._streams[f"cuboai_h264_{dev_id}"] = [
+                        f"ffmpeg:cuboai_combined_{dev_id}#video=h264#audio=aac#timeout=20"
+                        f"#width={width}#height={height}#hardware=vaapi#input=cuboai_vaapi#raw={fps_flag}",
+                    ]
+                else:
+                    hk = h264_transcode_args(self._options, fps_flag)
+                    self._streams[f"cuboai_h264_{dev_id}"] = [
+                        f"ffmpeg:cuboai_combined_{dev_id}#video=h264#audio=aac#timeout=20#raw={hk}",
+                    ]
 
             # Optional per-camera RTSP timestamp burn-in (opt-in). Burns the
             # wall-clock time into the video IMAGE so an NVR's recordings show
@@ -307,6 +530,31 @@ class Go2RTCManager:
                 )
                 self._streams[f"cuboai_stamped_{dev_id}"] = [
                     f"ffmpeg:cuboai_combined_{dev_id}#video=h264#audio=aac#timeout=20#raw=-vf {drawtext}",
+                ]
+
+            # UniFi Protect: ONE fixed stream name for the camera Protect gets,
+            # re-reading whichever real stream the H.264 option selects. Protect's
+            # media server locks in the stream address at adoption — a reconnect,
+            # Protect's own re-adopt, even a go2rtc restart did not make it pick
+            # up a changed address (seen live), so ticking "Transcode to H.264"
+            # after adopting silently kept a Cubo 3 on HEVC. With a fixed name
+            # the address never changes; only what is behind it does, from the
+            # next reconnect on. An RTSP loopback, not an ffmpeg leg: a pure
+            # re-read costs no transcode and spawns no extra process (go2rtc
+            # rejects a bare stream name as a source).
+            if self._options.get(OPT_PROTECT_ENABLED) and dev_id in protect_camera_ids(self._options, self._cameras):
+                rtsp_port = getattr(self, "_rtsp_port", None) or int(self._options.get("rtsp_port", 8555))
+                userinfo = ""
+                if self._options.get("nvr_enabled") and self._options.get("nvr_password"):
+                    from urllib.parse import quote
+
+                    userinfo = (
+                        f"{quote(self._options.get('nvr_username') or 'cuboai', safe='')}:"
+                        f"{quote(self._options['nvr_password'], safe='')}@"
+                    )
+                target = protect_stream_target(dev_id, self._options)
+                self._streams[protect_stream_name(dev_id, self._options)] = [
+                    f"rtsp://{userinfo}127.0.0.1:{rtsp_port}/{target}#timeout=20",
                 ]
 
             # Recorded footage from the camera's own DVR. Declared here rather
@@ -736,6 +984,15 @@ class Go2RTCManager:
         # made real: the file lives inside the integration directory and is ours to
         # own, and re-reading it would risk resurrecting exactly the stale entries
         # the loop was meant to remove.)
+        if getattr(self, "_vaapi_enabled", False):
+            device = self._options.get(OPT_VAAPI_DEVICE, "")
+            config["ffmpeg"] = {
+                "cuboai_vaapi": (
+                    f"-vaapi_device {device} -fflags nobuffer -flags low_delay -timeout {{timeout}} "
+                    "-user_agent go2rtc/ffmpeg -rtsp_flags prefer_tcp -i {input}"
+                ),
+                "h264/vaapi": VAAPI_H264_ARGS,
+            }
         config["streams"] = dict(self._streams)
         _LOGGER.info("go2rtc config written with streams: %s", sorted(self._streams))
 
@@ -895,10 +1152,17 @@ class Go2RTCManager:
     # ── watchdog ──────────────────────────────────────────────────────────────
 
     def _start_watchdog(self) -> None:
-        """(Re)arm the supervisor task for the current process."""
+        """(Re)arm the supervisor task for the current process.
+
+        A BACKGROUND task, never hass.async_create_task: HA's bootstrap waits for
+        every tracked task before it reports startup done, and this loop never
+        finishes. Tracked, it held every restart until the bootstrap wrap-up
+        timeout gave up on it ("Setup timed out for bootstrap waiting on
+        _watchdog()", ~5 minutes; seen live 2026-10-03).
+        """
         self._cancel_watchdog()
         self._watchdog_task = self.hass.async_create_background_task(
-            self._watchdog(), name="cuboai_go2rtc_watchdog"
+            self._watchdog(), f"cuboai go2rtc watchdog {self._entry_id}"
         )
 
     def _cancel_watchdog(self) -> None:

@@ -2,6 +2,373 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.6.50]
+
+### Fixed
+- **HomeKit shows the H.264 transcode instead of "No Response"** (#85). The transcode for H.265
+  cameras (Cubo 3 / SW05) reached HomeKit on time, but the Home app still showed nothing. The
+  picture's setup information (H.264 SPS/PPS) was sent only once, when the stream was opened, and
+  HomeKit does not pass that on to the Apple device, so the device received a picture it could
+  not decode. It is now repeated with every keyframe, as the camera's own H.264 does. This applies
+  to both the Software and the VAAPI encoder; nothing to change in the settings.
+- **Download diagnostics no longer calls a transcode slow because of its first seconds.** The
+  "slower than real time" message read ffmpeg's average since the start, so a slow start kept it
+  below the limit long after the transcode was keeping up. It now appears only when the picture is
+  more than 10 seconds behind.
+
+Diagnosed and tested by @DerHerzog7 (#85).
+
+## [2.6.49]
+
+### Added
+- **H.264 encoder: VAAPI (Linux GPU)** (Configure, #117). The H.264 transcode for H.265 cameras
+  (Cubo 3 / SW05) can now run on a Linux GPU through VAAPI instead of the processor. Choose
+  **VAAPI (Linux GPU)** under **H.264 encoder** and pick the render device. It is offered only when
+  Home Assistant can read and write a `/dev/dri/renderD*` device; otherwise only Software is shown.
+  Software stays the default, and existing installations are unchanged. At startup the integration
+  encodes one test frame on the GPU and uses software instead if that fails. Stream names and URLs
+  are the same with either encoder. For Home Assistant Container, pass the render device into the
+  container and include a VAAPI driver in the image; see the README.
+
+### Fixed
+- **The camera card says when its video player is missing** (#118). The picture comes from the
+  WebRTC Camera card, and when that card's code had not loaded (installed from HACS but not added
+  under Settings → Devices & Services, or a page from before the install) the camera card showed
+  its controls with no picture and no error. After 10 seconds it now shows what to install and to
+  reload the page, and the message goes away as soon as the player loads.
+
+Contributed by @divad-iohc (#116). Reported by @kamte (#118).
+
+## [2.6.48]
+
+### Fixed
+- **Home Assistant starts several minutes sooner** (#111). The streaming engine's watchdog, which runs
+  for as long as the integration does, was started as a task Home Assistant waits for during
+  startup. Startup therefore sat out its full wrap-up timeout on every start ("Setup timed out for
+  bootstrap waiting on … `_watchdog()`"), and HomeKit Bridge and automations were not started
+  until then. The watchdog, the camera's stream warm-up, the speaker queue and the lullaby timer
+  now run as background tasks. The reporter measured startup going from about 7 minutes to about 2.
+- **The RTSP port no longer moves after a restart** (#111). Home Assistant does not unload
+  integrations when it stops, so the streaming engine was only stopped on a reload. Where a restart
+  does not also end the container, the engine outlived Home Assistant and kept the RTSP port. The
+  next start then took another one (8557 → 8558), and every NVR or Scrypted URL broke until the
+  integration was reloaded. The engine is now stopped whenever Home Assistant stops, which also
+  lets the camera sessions close properly.
+
+Reported, diagnosed and tested by @mahmoudhamza21 (#111).
+
+## [2.6.47]
+
+### Fixed
+- **The H.264 transcode no longer encodes every frame twice** (HomeKit "No Response" on a Cubo 3,
+  #85). The transcode writes to the streaming engine's RTSP server, and ffmpeg pads that kind of
+  output up to the frame rate it guessed for the camera by repeating frames. A Cubo 3 was guessed at
+  29.92 fps while it sends 15, so more than half the frames the encoder worked on were repeats
+  (`dup=604` of 1120). On a Raspberry Pi 4 the conversion then ran at 0.53–0.66x real time, so the
+  picture fell further behind the longer it was open and HomeKit gave up. Each camera frame is now
+  encoded exactly once.
+- **The H.264 transcode starts showing sooner.** A new viewer (HomeKit, Home Assistant's player)
+  waits for a keyframe before it can show anything. The transcode made one every 50 frames, which
+  was 5 seconds on a Cubo 2 measured sending 10 fps. It is now every 15 frames: 1 to 1.5 seconds at
+  the 10–15 fps the cameras send.
+
+### Added
+- **Size of the H.264 transcode** (Configure): `1080p` (the default, as before) or `720p`, for a
+  machine that cannot convert 1080p in real time, such as a Raspberry Pi 4. A smaller camera picture
+  is never enlarged. Measured on a Raspberry Pi 5 with a Cubo 2: 0.38 of a processor core at 720p
+  against 0.56 at 1080p.
+- **Download diagnostics says when a conversion is too slow:** any video conversion that runs below
+  0.9x real time after its first 20 seconds gets a verdict with the speed, how far behind the
+  picture was, and what to do. The camera is named when it is the only one being converted.
+
+### Changed
+- In the diagnostics download, `video_codecs_seen` is now `camera_video_codecs`. It only ever counted
+  what the cameras send (for every camera together), never what a conversion outputs: `{"hevc": …}`
+  there does not mean HomeKit was handed H.265. The new `transcode` section lists the conversions'
+  progress (speed, repeated frames).
+
+## [2.6.46]
+
+### Fixed
+- **A rejected CuboAI sign-in no longer needs a reinstall.** When CuboAI refused the saved
+  session (`401 Unauthorized` from its token endpoint), the integration stayed on "Failed setup,
+  will retry", and the only way back was removing it and deleting its token files. Home Assistant
+  now shows **"Sign in to CuboAI again"** on the CuboAI entry instead: sign in with the same account
+  (and the two-factor code, if you use one) and it reconnects, keeping your cameras, entity IDs and
+  settings. Signing in with a different account is refused. Temporary network or server errors
+  still just retry, and never erase the saved session.
+- **Each account keeps its own session.** Tokens were also kept in two files shared by every
+  CuboAI entry and read in preference to the entry's own, so a fresh sign-in could be replaced by an
+  older, revoked pair, and with two accounts one could start up with the other's session. Tokens now
+  live only in their own config entry. The old `cuboai_access_token.json` /
+  `cuboai_refresh_token.json` files are left in place but no longer read or written. In testing,
+  an existing install upgraded without being asked to sign in.
+
+Contributed by @NartsAi (#109). Tested on a live Home Assistant: an expired access token renews into
+the entry on startup without a prompt; a rejected session raises the sign-in prompt, and signing in
+restores the same entry.
+
+## [2.6.45]
+
+### Fixed
+- **Sending a file or text-to-speech to the camera speaker failed on some installs** with
+  `avcodec_send_frame() returned 22 (Invalid argument)` (seen with PyAV 17.0.1). The about 3.5
+  seconds of silence added to the end of every clip was not silence: a new audio frame is
+  uninitialised memory, and about half the time it held invalid numbers (NaN/Inf), which the AAC
+  encoder refuses. Where it did not fail, that leftover memory played as a short burst of noise at
+  the end of the clip. The padding is now zeroed, so it is real silence and the send always
+  completes. The encoder's channel layout is now set to stereo explicitly (it was already stereo by
+  default); the camera receives the same format as before (AAC-LC, 16 kHz, 32 kbit/s) at the same
+  loudness. Verified against a real camera with a silent file: every frame delivered and decoded.
+
+## [2.6.44]
+
+> Tested on an iPhone in the Home Assistant app with a real camera, and offline: the card's code in
+> Node and in a browser against a stand-in Home Assistant, the Home Assistant side against fakes,
+> and the whole path from the card's audio to the camera talk as a dry run. How the microphone
+> works, for maintainers: [docs/two-way-audio.md](docs/two-way-audio.md).
+
+### Added
+- **Talk to the room from the card.** The microphone button on the video (top left) now works:
+  tap it to talk through the camera's speaker, tap it again to stop. It turns amber while the
+  camera opens its speaker, which takes a few seconds, and red once the camera is listening.
+  - The sound travels over Home Assistant's own connection, the one the dashboard already uses, so
+    it works at home and away (Home Assistant Cloud, or your own https address or tunnel) with no
+    VPN, open port or WebRTC setup. Home Assistant hands it to a separate process on the Home
+    Assistant machine, which runs the camera's talk session.
+  - It needs Home Assistant opened over **https**: browsers only give a web page the microphone on
+    a secure address. On a plain `http://` address the button says so. In the Home Assistant app
+    this includes the home (internal) URL.
+  - A talk lasts at most **2 minutes**. It also stops when the app goes to the background, the
+    connection drops, a call takes the microphone, or no audio arrives for 6 seconds.
+  - **One talker per camera.** While the camera's Speaker entity is playing a song or TTS, the
+    button refuses and asks you to stop the music first; while someone is talking, songs and TTS are
+    refused. Nothing is cut off.
+  - **By default talking never changes the speaker.** The room's sound on your phone stays exactly
+    as you and the card's audio setting have it; the phone's own echo cancellation keeps its speaker
+    out of the microphone.
+  - **Option `talk_mutes_speaker`** (also in the visual editor, off by default): mute the room's
+    sound on this device while talking. It is muted once the microphone is captured and comes back
+    inside your stop tap (an iPhone only turns sound on in a tap); a speaker tap during the talk
+    stands; nothing is saved or synced to other devices. The speaker icon simply follows the
+    sound. (A first, always-on version restored the sound after the talk and could come out the
+    opposite way on an iPhone.)
+  - Anyone allowed to control the camera's Speaker entity can talk; an admin user is not needed.
+  - **Test mode:** `talk_dry_run: true` in the card's YAML runs everything except the camera, so
+    nothing plays in the room. The notice on the video starts with *TEST MODE*.
+  - Restart Home Assistant after updating: the talk command is registered at startup.
+
+- **No black gap when the stream changes.** When your phone moves between Wi-Fi and mobile data
+  (WebRTC stops, the fallback starts), after a reconnect, or when switching to a recording, the
+  video used to go black until the new stream's first full picture (up to the camera's 4-second
+  keyframe interval). The last picture now stays on screen until the new picture is really showing,
+  with *Reconnecting…* if the gap outlasts a blink; it is held for as long as a reconnect can take
+  (up to 25 s), then 8 s once the new stream has arrived, and an old picture is never shown again,
+  so a frozen picture can't pass for live. Switching to a recording is not bridged. When Home
+  Assistant rebuilds a YAML dashboard after a network change (a brand-new card, a new empty video),
+  the new card starts from the old card's last picture of the same camera; and a new stream that an
+  iPhone leaves paused is started (muted if the phone refuses sound without a tap). Known: on an
+  iPhone, moving from Wi-Fi to mobile data can still show a short black moment; mobile data to
+  Wi-Fi is seamless.
+- **The picture no longer stays black after a network change.** When the phone moves from Wi-Fi to
+  mobile data, the WebRTC Camera player asks Home Assistant for a new stream address at the very
+  moment Home Assistant's own connection is down; that request fails and the player never tried
+  again, so the picture stayed black until the app was reopened. The card now dials the player
+  again once Home Assistant is back (only for a player that has played before, and never while it
+  is connected or connecting).
+
+### Fixed
+- **On an iPhone the card's audio setting now applies when the camera opens.** Since 2.4.0 every
+  player started muted and the card brought the sound up on the first tap, but on Apple devices that
+  step is switched off (the player's own speaker button owns mute there), so an iPhone always opened
+  muted: *Always Unmuted*, or a remembered unmute, was ignored. On Apple the setting is the starting
+  state again, as in 2.3.x. If the phone refuses sound without a tap, the player falls back to muted
+  by itself and one tap on its speaker button brings it up. Other devices are unchanged.
+
+### Changed
+- The live video no longer carries the microphone. The old, hidden mic button reconfigured and
+  reconnected the video player on every tap; the talk now has its own path and never touches the
+  picture.
+
+## [2.6.43]
+
+### Fixed
+- **Sound and picture away from home.** When WebRTC can't connect (for example on mobile data
+  through a Cloudflare tunnel, with no VPN), the WebRTC Camera player falls back to MSE, and two
+  things in its MSE code broke playback there:
+  - It sets the playback speed to the number of seconds it has buffered, many times a second, so
+    over a bursty connection the speed swings between about 0.1x and 3x. The stream carried a song
+    continuously (measured) while an iPhone played one-second fragments of it.
+  - It trims its buffer to the last 5 seconds, and a browser removes video up to the next
+    keyframe. The camera sends one every 4 seconds, so a trim can delete the frames being played:
+    the picture freezes and the sound with it.
+
+  The card now keeps the trim at least 8 seconds (two keyframe intervals) behind the playhead, and
+  sets the speed itself from the real buffer: normal while 2–4 seconds are buffered, 0.8x below
+  that, 1.25x above, changing rarely. Against the live camera with the real player and simulated
+  mobile-data delivery, the picture kept moving 99.5% of the time (62% before; the old player
+  ended frozen), with no trims into the playing frames and 8 speed changes a minute instead of
+  about 500. Away from home the picture runs about 3–4 seconds behind live. At home (WebRTC)
+  nothing changes. Nothing in the WebRTC Camera integration is modified; the card hooks only its
+  own video element. Confirmed on an iPhone on 5G: continuous sound, moving picture.
+
+## [2.6.42]
+
+### Fixed
+- **Two Configure fields showed their raw key**: *Maximum number of downloaded photos to keep*
+  (`max_saved_photos`) and the RTSP timestamp choice (`rtsp_timestamp_cameras`, now *Burn the date and
+  time into these cameras' NVR recordings*, with an explanation). A test now requires a label for
+  every setup and Configure field in both translation files (the per-camera IP fields excepted; their
+  keys are per camera).
+- **The first-run UniFi Protect text** read "find your first camera and add them as third-party
+  cameras" (a v2.6.41 wording slip). It now describes the first camera, and the label says so.
+- The `cuboai.play_recording` description claimed "roughly the last 72 hours"; measured retention is
+  about two days, or 18–20 hours with baby-presence detection on.
+
+### Changed
+- **README rewritten**: every setup and Configure option in one place, entity and service tables,
+  one section per feature, and new screenshots of the card, playback, music, editor, timeline, setup,
+  Configure, sensors and notifications. Version history and investigation notes left the README
+  (they are in this changelog); deep NVR troubleshooting moved to `docs/nvr-troubleshooting.md` and
+  engine internals, ports and stall tunables to `docs/advanced.md`.
+- **The screenshots are rendered, not captured**: `tools/docs-images/` runs the real card code and
+  the real config-flow schema against made-up sample data, so no personal data can appear in them
+  and they can be regenerated.
+- The example dashboard and its README use a camera named `baby`.
+
+### Removed
+- Old screenshots that showed a real device id or a real room, and an unreferenced image in the
+  repository root.
+
+## [2.6.41]
+
+### Added
+- **Several cameras in UniFi Protect.** Configure now takes a list of cameras to show in Protect
+  instead of one. Earlier versions allowed one camera per Home Assistant host on the belief that
+  Protect tells third-party cameras apart by the host's MAC address. Tested on a live UDM, it goes
+  by the MAC each camera *reports* over ONVIF: a second device on the same address, on another
+  port and reporting its own MAC, was adopted as a second camera and both streamed. Each camera
+  now gets its own port and MAC. The first keeps the host's real MAC and the port set in
+  Configure, so a camera already in Protect is unchanged; each further camera gets the next free
+  port and a fixed, locally administered MAC derived from its id. A camera keeps its port for
+  good once it has one, even when it is unticked and ticked again, because Protect remembers
+  ip:port. A camera whose port is taken is reported and the others keep running.
+- **Each camera appears in Protect under its own name.** Protect names a third-party camera
+  "Manufacturer Model", and the Model was always "Baby Monitor", so every camera was "CuboAI Baby
+  Monitor". The Model is now the device's name as renamed in Home Assistant, else the camera's
+  name in the CuboAI app.
+  Protect reads the name only when it adds a camera (tested live: it kept the old name through
+  several minutes of its once-a-minute re-reads, and took the new one on re-adding). A camera
+  added before this version needs one remove-and-add in Protect, or a rename there.
+- Diagnostics reports each exposed camera separately (address, port, codec, which stream Protect
+  pulls) and names the camera in every Protect verdict. Camera names never appear in it.
+
+### Changed
+- An install from v2.6.37–2.6.40 keeps its one camera in Protect on the same port and MAC; the
+  first save of Configure records it as the first camera.
+
+## [2.6.40]
+
+### Added
+- **UniFi Protect now shows a Cubo 3 as H.265.** ONVIF's original media service (Media v1) can
+  only describe JPEG, MPEG-4 or H.264, so a camera sending HEVC was reported to Protect as H.264.
+  Protect then labelled it H.264 while passing the real H.265 through to viewers, tested on a
+  live UDM. The integration now also offers ONVIF **Media2**, which can say H.265. Offered both,
+  Protect reads Media2 only, and on a live UDM it labelled an H.265 stream `h265`, took the H.265
+  stream and served snapshots.
+
+  The codec it is told is never guessed. It is H.264 when *Transcode these cameras to H.264* is on
+  for that camera. Otherwise it is what the streaming engine is actually receiving from the
+  camera, re-checked at most every 30 s from the engine's own status (read-only: checking never
+  starts a camera session). Until the camera has streamed once since Home Assistant started, the
+  answer stays H.264, as before. Media v1 keeps answering for clients that only speak v1, and
+  still says H.264 there, the only value v1 allows.
+- Download diagnostics shows the codec Protect is told (`unifi_protect.advertised_encoding`).
+- Tested on a live UDM in both directions: Protect re-reads the codec about once a minute, and
+  after switching *Transcode these cameras to H.264* its label and the video it serves followed
+  within about 20 seconds, with no re-adding. A camera added before v2.6.40 stays on Media v1
+  (which can only say H.264), so a Cubo 3 needs to be removed and added again once.
+
+### Changed
+- The diagnostics verdict for an H.265 camera in Protect no longer says Protect "cannot play" it.
+  Protect accepts H.265 and passes it through unconverted, so the verdict now says that a viewer
+  that cannot decode H.265 shows no picture, and what to turn on if that happens.
+
+## [2.6.39]
+
+### Fixed
+- **UniFi Protect ignored a change to the H.264 option.** Protect's media server keeps the stream
+  address it is given when a camera is adopted. A reconnect, Protect's own "re-adopt" and a restart
+  of the streaming engine all left it pulling the old stream, tested on a live UDM. So a Cubo 3
+  owner who ticked *Transcode these cameras to H.264* after adding the camera, as diagnostics
+  advises, kept sending Protect H.265.
+
+  Protect is now pointed at one fixed stream, `cuboai_protect_<camera>`, which re-reads either the
+  camera's native stream or its H.264 transcode, whichever the option selects. The address Protect
+  keeps never changes, so the option takes effect at the next reconnect in both directions without
+  re-adding the camera. The fixed stream is a plain re-read inside the streaming engine: no
+  transcode and no extra process. It only exists while UniFi Protect support is on.
+
+  A camera added with v2.6.37 or v2.6.38 is still on its old address and needs to be removed and
+  added again once. Download diagnostics now spots this and says so.
+
+## [2.6.38]
+
+### Fixed
+- The manifest now declares the `network` integration, which the UniFi Protect support (2.6.37)
+  uses to find Home Assistant's LAN address. Without the declaration Home Assistant does not
+  guarantee `network` is set up first. It worked on the test system through load order, and
+  Home Assistant's own validator (Hassfest) rejected it. A test now checks that every integration
+  this code calls is declared.
+
+## [2.6.37]
+
+### Added
+- **UniFi Protect: show a CuboAI camera in a UniFi console.** A new option (first-run setup and
+  Configure) presents one camera to **UniFi Protect** as a third-party ONVIF camera. Protect can
+  find it through its *Discover Third-Party Cameras* setting, or add it by address with *Advanced
+  Adoption*, which works across VLANs. Protect then pulls the video from the integration's
+  streaming engine, like an NVR does.
+
+  The integration now runs a small ONVIF device of its own, rather than relying on the ONVIF server
+  built into the streaming engine. That built-in server was not fit for Protect:
+  - it offered every internal stream as a "camera" (including the speaker-only and playback
+    streams);
+  - it advertised the same fixed resolution for all of them;
+  - it had no password;
+  - it rejected the settings Protect 7.2 pushes to cameras, which Protect reports as "invalid
+    credentials".
+
+  The new server offers exactly one camera with a high- and a low-quality profile, checks the
+  username and password (WS-Security), and hands Protect a video-only stream, since Protect cannot
+  play AAC. Settings Protect pushes (time, encoding, reboot) are accepted and ignored, so nothing
+  Protect sends can change the integration or the camera. Anything Protect asks for that isn't
+  answered yet is logged and shown in Download diagnostics.
+
+  Discovery shares UDP port 3702 with Windows network discovery (the Samba add-on's `wsdd`). It
+  answers only ONVIF camera probes, matched by namespace, because Windows asks for `wsdp:Device`
+  and ONVIF for `tds:Device`: the same name in different namespaces. Windows network browsing is
+  unaffected.
+
+  Limits:
+  - **One camera per Home Assistant host.** Protect identifies third-party cameras by the host's
+    MAC address.
+  - **H.264 only.** A Cubo 3 needs its H.264 transcode on, and diagnostics says so.
+  - **Video only.**
+  - **Recording needs a drive in the console.**
+  - **The ONVIF port (8899) is pinned, never moved automatically.** Protect remembers the address
+    it adopted.
+
+  Verified end to end on a UDM Pro Max running Protect 7.2.105: adopted by address across VLANs on
+  the first attempt, streaming, snapshots working, and reconnecting on its own after a Home
+  Assistant restart. Protect used 8 ONVIF operations, all answered, with zero authentication
+  failures. An existing NVR kept recording the same camera throughout.
+
+### Fixed
+- Download diagnostics now treats any setting whose name contains "password" or "token" as a
+  secret. The list was explicit before, so the new UniFi Protect password would have been published
+  in the options section of the report. This was caught before release.
+
 ## [2.6.36]
 
 ### Fixed

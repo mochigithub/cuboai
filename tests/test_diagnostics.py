@@ -24,13 +24,13 @@ from custom_components.cuboai.const import DOMAIN
 
 DEV = "SW05AABBCCDD1122"
 UID = "TUTKUID0000XYZ9"
-BABY = "Mia Rose"
+BABY = "Zuzu Pell"
 CAM_PW = "s3cretCamPass"
 ACCOUNT = "someone@example.com"
 LOGIN_PW = "LoginPw123"
 TOKEN = "tok_eyJhbGciOiJIUzI1NiJ9abcdef"
 NVR_PW = "nvrPw77"
-ENTITY = "camera.cuboai_mia_rose"
+ENTITY = "camera.cuboai_zuzu_pell"
 
 LOG = [
     f'12:00:00.000 DBG [exec] run pipe args=["env","CUBOAI_UID={UID}","CUBOAI_ACCOUNT={ACCOUNT}",'
@@ -40,7 +40,7 @@ LOG = [
     "12:00:03.000 WRN [rtsp] error=461 Unsupported transport",
     "12:00:04.000 DBG [exec] [health t=10s] fps 10.0 1.2Mbps",
     f"12:00:05.000 DBG [rtsp] url rtsp://admin:{NVR_PW}@192.168.1.5:8557/cuboai_combined_{DEV}",
-    "12:00:06.000 DBG [homekit] linked binary_sensor.cuboai_mia_rose_crying",
+    "12:00:06.000 DBG [homekit] linked binary_sensor.cuboai_zuzu_pell_crying",
 ]
 
 H265_LIVE = {
@@ -114,7 +114,7 @@ async def test_nothing_personal_survives_anywhere_in_the_download():
     report, _ = await _diagnose(_hass(homekit_entries=[hk]), _entry())
     blob = json.dumps(report)
 
-    for secret in (DEV, UID, CAM_PW, ACCOUNT, LOGIN_PW, TOKEN, NVR_PW, "Mia", "mia_rose", "Rose"):
+    for secret in (DEV, UID, CAM_PW, ACCOUNT, LOGIN_PW, TOKEN, NVR_PW, "Zuzu", "zuzu_pell", "Pell"):
         assert secret.lower() not in blob.lower(), f"{secret!r} leaked into the diagnostics download"
 
 
@@ -234,7 +234,7 @@ async def test_the_log_supplies_the_codec_when_the_stream_is_idle():
     Kill: the go2rtc.log codec fallback removed."""
     report, _ = await _diagnose(_hass(), _entry(), streams={})
 
-    assert report["go2rtc_log"]["video_codecs_seen"] == {"hevc": 1}
+    assert report["go2rtc_log"]["camera_video_codecs"] == {"hevc": 1}
     assert any("sends HEVC" in v for v in report["verdicts"]), report["verdicts"]
 
 
@@ -454,6 +454,121 @@ async def test_a_multi_camera_install_does_not_blame_a_particular_camera():
 
 
 # =============================================================================
+# UniFi Protect
+# =============================================================================
+
+
+def _protect_service(**stats):
+    base = {
+        "running": True,
+        "start_error": None,
+        "address": "10.9.8.7:8899",
+        "mac_known": True,
+        "discovery_bound": True,
+        "discovery_error": None,
+        "probes_answered": 0,
+        "requests": {},
+        "unhandled_operations": {},
+        "auth_failures": 0,
+        "clients": [],
+    }
+    base.update(stats)
+    service = SimpleNamespace(stats=lambda: dict(base), camera_id=lambda: DEV)
+    return SimpleNamespace(services={DEV: service}, start_error=None)
+
+
+async def _diagnose_protect(service, options=None, streams=H265_LIVE, log=LOG):
+    hass = _hass()
+    hass.data[DOMAIN]["entryA"]["onvif"] = service
+    entry = _entry(options={"unifi_protect_enabled": True, "unifi_protect_password": "ProtectPw!9", **(options or {})})
+    return (await _diagnose(hass, entry, streams=streams, log=log))[0]
+
+
+@pytest.mark.asyncio
+async def test_the_protect_password_never_reaches_the_download():
+    """End to end, the leak found before shipping. Kill: the protect password
+    neither blanked by key nor redacted by value."""
+    # In a log line too: only redaction BY VALUE catches it there, while the
+    # options entry is blanked BY KEY — each layer needs its own witness.
+    log = LOG + ["12:00:08.000 DBG [onvif] client sent ProtectPw!9 in a header"]
+    report = await _diagnose_protect(_protect_service(), log=log)
+    assert "ProtectPw!9" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_protect_section_names_the_camera_by_alias():
+    report = await _diagnose_protect(_protect_service())
+    cams = report["unifi_protect"]["cameras"]
+    assert [c["camera"] for c in cams] == ["camera_1"]
+    assert cams[0]["address"] == "10.9.8.7:8899"
+
+
+@pytest.mark.asyncio
+async def test_an_hevc_camera_shown_to_protect_without_transcode_is_called_out():
+    """Protect passes H.265 through unconverted. Kill: the Protect HEVC verdict removed."""
+    report = await _diagnose_protect(_protect_service())
+    assert any("shown to UniFi Protect as H.265" in v for v in report["verdicts"]), report["verdicts"]
+
+
+@pytest.mark.asyncio
+async def test_protect_not_running_is_called_out():
+    """Kill: the not-running verdict removed."""
+    report = await _diagnose_protect(_protect_service(running=False, start_error="port 8899 unavailable"))
+    assert any("not running: port 8899 unavailable" in v for v in report["verdicts"]), report["verdicts"]
+
+
+@pytest.mark.asyncio
+async def test_no_discovery_points_at_advanced_adoption():
+    """Kill: the discovery verdict removed or the address dropped from it."""
+    report = await _diagnose_protect(_protect_service(discovery_bound=False, discovery_error="in use"))
+    hit = next(v for v in report["verdicts"] if "Advanced Adoption" in v)
+    assert "10.9.8.7:8899" in hit
+
+
+@pytest.mark.asyncio
+async def test_unhandled_operations_and_auth_failures_are_reported():
+    """The adoption loop's two signals. Kill: either verdict removed."""
+    service = _protect_service(unhandled_operations={"GetEventProperties": 2}, auth_failures=3)
+    joined = " ".join((await _diagnose_protect(service))["verdicts"])
+    assert "GetEventProperties" in joined
+    assert "3 request(s)" in joined
+
+
+def _protect_pulling(stream_name):
+    return {
+        stream_name: {
+            "producers": [{"medias": ["video, recvonly, H264"]}],
+            "consumers": [{"user_agent": "Media Server (www.ui.com)", "protocol": "rtsp"}],
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_protect_stuck_on_an_old_stream_is_told_to_re_adopt_once():
+    """Protect keeps the address it got at adoption. A camera adopted before
+    the fixed stream existed keeps pulling the old one. Kill: the stale-stream
+    verdict removed."""
+    report = await _diagnose_protect(_protect_service(), streams=_protect_pulling(f"cuboai_combined_{DEV}"))
+    hit = next((v for v in report["verdicts"] if "adopt it again" in v), None)
+    assert hit and "cuboai_combined_camera_1" in hit and "cuboai_protect_camera_1" in hit, report["verdicts"]
+    assert report["unifi_protect"]["protect_pulling"] == ["cuboai_combined_camera_1"]
+
+
+@pytest.mark.asyncio
+async def test_protect_on_the_fixed_stream_raises_nothing():
+    """Kill: the verdict firing on the correct stream too."""
+    report = await _diagnose_protect(_protect_service(), streams=_protect_pulling(f"cuboai_protect_{DEV}"))
+    assert not any("adopt it again" in v for v in report["verdicts"]), report["verdicts"]
+
+
+@pytest.mark.asyncio
+async def test_protect_switched_off_adds_nothing():
+    report = (await _diagnose(_hass(), _entry(), streams=H264_LIVE, log=[LOG[2]]))[0]
+    assert report["unifi_protect"] == {"enabled": False}
+    assert not any("Protect" in v for v in report["verdicts"])
+
+
+# =============================================================================
 # Robustness
 # =============================================================================
 
@@ -529,3 +644,222 @@ async def test_remembered_streams_appear_in_the_download():
     assert report["cameras"]["camera_1"]["recent_stream_requests"] == [
         {"stream": "cuboai_combined_camera_1", "at": "2026-09-22T10:00:00+00:00"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_two_protect_cameras_are_reported_and_judged_separately():
+    """v2.6.41: each exposed camera has its own service. A problem on one
+    must be pinned on that one. Kill: the per-camera loop collapsed onto the
+    first camera, or the stale-stream check not scoped to its own camera."""
+    dev2 = "CB02EEFF00112233"
+    cams = [
+        {"device_id": DEV, "uid": UID, "baby_name": BABY, "password": CAM_PW, "account": ACCOUNT},
+        {
+            "device_id": dev2,
+            "uid": "TUTKUID0000ABC1",
+            "baby_name": "Second Kid",
+            "password": CAM_PW,
+            "account": ACCOUNT,
+        },
+    ]
+    down = _protect_service(running=False, start_error="port 8899 unavailable").services[DEV]
+    up = _protect_service(address="10.9.8.7:8900").services[DEV]
+    group = SimpleNamespace(services={DEV: down, dev2: up}, start_error=None)
+    streams = {**H264_LIVE, **_protect_pulling(f"cuboai_combined_{dev2}")}
+    hass = _hass()
+    hass.data[DOMAIN]["entryA"]["onvif"] = group
+    entry = _entry(
+        options={"unifi_protect_enabled": True, "unifi_protect_password": "ProtectPw!9"},
+        cameras=cams,
+    )
+    report = (await _diagnose(hass, entry, streams=streams))[0]
+    section = report["unifi_protect"]
+    assert [c["camera"] for c in section["cameras"]] == ["camera_1", "camera_2"]
+    joined = json.dumps(report)
+    assert BABY not in joined and "Second Kid" not in joined
+    not_running = [v for v in report["verdicts"] if "not running" in v]
+    assert len(not_running) == 1 and "camera_1" in not_running[0], report["verdicts"]
+    stale = [v for v in report["verdicts"] if "adopt it again" in v]
+    assert len(stale) == 1 and "camera_2" in stale[0] and "cuboai_protect_camera_2" in stale[0], report["verdicts"]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_stream_is_blamed_on_its_own_camera_only():
+    """Both cameras up; Protect pulls camera_1 correctly and camera_2 on an old
+    stream. Kill: each camera judged against every stream Protect pulls."""
+    dev2 = "CB02EEFF00112233"
+    cams = [
+        {"device_id": DEV, "uid": UID, "baby_name": BABY, "password": CAM_PW, "account": ACCOUNT},
+        {
+            "device_id": dev2,
+            "uid": "TUTKUID0000ABC1",
+            "baby_name": "Second Kid",
+            "password": CAM_PW,
+            "account": ACCOUNT,
+        },
+    ]
+    one = _protect_service().services[DEV]
+    two = _protect_service(address="10.9.8.7:8900").services[DEV]
+    group = SimpleNamespace(services={DEV: one, dev2: two}, start_error=None)
+    streams = {
+        **H264_LIVE,
+        **_protect_pulling(f"cuboai_protect_{DEV}"),
+        **_protect_pulling(f"cuboai_combined_{dev2}"),
+    }
+    hass = _hass()
+    hass.data[DOMAIN]["entryA"]["onvif"] = group
+    entry = _entry(options={"unifi_protect_enabled": True, "unifi_protect_password": "ProtectPw!9"}, cameras=cams)
+    report = (await _diagnose(hass, entry, streams=streams))[0]
+    stale = [v for v in report["verdicts"] if "adopt it again" in v]
+    assert len(stale) == 1 and "camera_2" in stale[0], report["verdicts"]
+
+
+# =============================================================================
+# A conversion that cannot keep up (#85, 2.6.47)
+# =============================================================================
+
+# Verbatim from the reporter's downloads (ffmpeg 8.1 on a Raspberry Pi 4, as
+# go2rtc logs it with debug logs on).
+SLOW_066 = (
+    "21:45:22.194 DBG [exec] frame= 1120 fps= 20 q=17.0 size=N/A time=00:00:37.43 bitrate=N/A "
+    "dup=604 drop=0 speed=0.661x elapsed=0:00:56.67"
+)
+SLOW_053 = (
+    "10:05:24.001 DBG [exec] frame= 1273 fps= 16 q=17.0 size=N/A time=00:00:42.55 bitrate=N/A "
+    "dup=680 drop=0 speed=0.53x elapsed=0:01:20.21"
+)
+# ffmpeg leaves dup/drop out while both are 0 (every camera frame once).
+KEEPS_UP = (
+    "10:05:24.001 DBG [exec] frame=  600 fps= 15 q=23.0 size=N/A time=00:00:40.02 bitrate=N/A "
+    "speed=0.998x elapsed=0:00:40.10"
+)
+
+
+def test_the_reporters_progress_line_is_read():
+    """Kill: any field of the progress regex broken."""
+    p = diag.parse_progress(SLOW_066)
+    assert p == {
+        "frame": 1120,
+        "encode_fps": 20.0,
+        "video_time_s": 37.43,
+        "elapsed_s": 56.67,
+        "speed": 0.661,
+        "dup": 604,
+        "drop": 0,
+        "repeated_frames_pct": 53.9,
+    }
+
+
+def test_a_line_without_dup_or_elapsed_is_still_read():
+    """ffmpeg prints no dup/drop while both are 0, and no elapsed= before 7.x.
+    Kill: either group made mandatory."""
+    p = diag.parse_progress("frame=  300 fps= 15 q=23.0 size=N/A time=00:00:20.00 bitrate=N/A speed=1.00x")
+    assert (p["dup"], p["elapsed_s"], p["speed"], p["video_time_s"]) == (0, None, 1.0, 20.0)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # video only copied (an audio conversion for WebRTC): says nothing about H.264
+        "frame=  900 fps= 15 q=-1.0 size=N/A time=00:01:00.00 bitrate=N/A speed=0.5x elapsed=0:02:00.00",
+        # libx264's per-frame debug line
+        "DBG [exec] [libx264 @ 0x7fa1a0e870] frame=1109 QP=13.03 NAL=2 Slice:P Poc:18 I:70 P:1057 SKIP:7033",
+        # not started yet
+        "frame=    0 fps=0.0 q=0.0 size=N/A time=N/A bitrate=N/A speed=N/A elapsed=0:00:01.00",
+    ],
+)
+def test_lines_that_are_not_a_video_conversion_are_ignored(line):
+    """Kill: the q >= 0 check removed, or the regex loosened."""
+    assert diag.parse_progress(line) is None
+
+
+@pytest.mark.asyncio
+async def test_a_slow_conversion_is_called_out_on_the_camera_that_converts():
+    """THE #85 finding of 2026-09-29, which the download did not state.
+    Kill: the verdict removed, or the SLOW_SPEED comparison inverted."""
+    report, _ = await _diagnose(_hass(), _entry(options={"h264_cameras": [DEV]}), log=LOG + [SLOW_053])
+    hits = [v for v in report["verdicts"] if "slower than real time" in v]
+    assert len(hits) == 1, report["verdicts"]
+    assert "camera_1" in hits[0] and "0.53x" in hits[0] and "No Response" in hits[0]
+    assert "43 s of video in 80 s" in hits[0] and "38 s behind" in hits[0]
+    assert "720p" in hits[0], "at 1080p the verdict must point at the size option"
+    transcode = report["go2rtc_log"]["transcode"]
+    assert transcode["slow"]["speed"] == 0.53 and transcode["slowest_speed"] == 0.53
+
+
+@pytest.mark.asyncio
+async def test_a_conversion_that_keeps_up_raises_nothing():
+    """Kill: the threshold dropped (every conversion called slow)."""
+    report, _ = await _diagnose(_hass(), _entry(options={"h264_cameras": [DEV]}), log=LOG + [KEEPS_UP])
+    assert not any("slower than real time" in v for v in report["verdicts"]), report["verdicts"]
+    assert report["go2rtc_log"]["transcode"]["slowest_speed"] == 0.998
+
+
+@pytest.mark.asyncio
+async def test_the_first_seconds_are_not_judged():
+    """Early on, ffmpeg is still catching up with what it buffered while it
+    waited for a keyframe. Kill: the warm-up check removed."""
+    early = "frame=  60 fps= 9 q=17.0 size=N/A time=00:00:04.00 bitrate=N/A speed=0.40x elapsed=0:00:10.00"
+    report, _ = await _diagnose(_hass(), _entry(options={"h264_cameras": [DEV]}), log=LOG + [early])
+    assert not any("slower than real time" in v for v in report["verdicts"]), report["verdicts"]
+
+
+@pytest.mark.asyncio
+async def test_without_elapsed_the_wall_time_is_worked_out_from_the_speed():
+    """Before ffmpeg 7.x: 30 s of video at 0.5x took 60 s. Kill: the fallback
+    removed (a TypeError on None) or the warm-up not falling back to video time."""
+    old = "frame=  450 fps= 7 q=17.0 size=N/A time=00:00:30.00 bitrate=N/A speed=0.5x"
+    report, _ = await _diagnose(_hass(), _entry(options={"h264_cameras": [DEV]}), log=LOG + [old])
+    hits = [v for v in report["verdicts"] if "slower than real time" in v]
+    assert hits and "30 s of video in 60 s" in hits[0], report["verdicts"]
+
+
+@pytest.mark.asyncio
+async def test_already_at_720p_the_advice_is_not_720p_again():
+    """Kill: the size check dropped from the advice."""
+    entry = _entry(options={"h264_cameras": [DEV], "h264_resolution": "720p"})
+    report, _ = await _diagnose(_hass(), entry, log=LOG + [SLOW_066])
+    hits = [v for v in report["verdicts"] if "slower than real time" in v]
+    assert hits and "Set 'Size of the H.264 transcode' to 720p" not in hits[0], report["verdicts"]
+    assert report["cameras"]["camera_1"]["h264_resolution"] == "720p"
+
+
+@pytest.mark.asyncio
+async def test_with_two_conversions_no_camera_is_blamed():
+    """The log does not say which stream a progress line belongs to. Kill:
+    the camera named although another conversion could have written it."""
+    stamped = _entry(options={"h264_cameras": [DEV], "rtsp_timestamp_cameras": [DEV]})
+    report, _ = await _diagnose(_hass(), stamped, log=LOG + [SLOW_066])
+    hits = [v for v in report["verdicts"] if "slower than real time" in v]
+    assert hits and hits[0].startswith("A video conversion"), report["verdicts"]
+
+
+@pytest.mark.asyncio
+async def test_the_camera_side_and_the_conversion_are_reported_apart():
+    """`video_codecs_seen` mixed them up: {"hevc": 271} read as "HomeKit gets
+    HEVC" while HomeKit got the H.264 conversion. Kill: the old key restored or
+    the conversion section dropped."""
+    report, _ = await _diagnose(_hass(), _entry(options={"h264_cameras": [DEV]}), log=LOG + [SLOW_066, KEEPS_UP])
+    log = report["go2rtc_log"]
+    assert "video_codecs_seen" not in log
+    assert log["camera_video_codecs"] == {"hevc": 1}
+    assert [p["speed"] for p in log["transcode"]["latest"]] == [0.661, 0.998]
+    assert report["cameras"]["camera_1"]["h264_resolution"] == "1080p"
+
+
+@pytest.mark.asyncio
+async def test_a_camera_without_the_transcode_reports_no_size():
+    """Kill: the size reported for a camera that is not converted."""
+    report, _ = await _diagnose(_hass(), _entry())
+    assert report["cameras"]["camera_1"]["h264_resolution"] is None
+    assert report["cameras"]["camera_1"]["h264_encoder"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready,encoder", [(True, "vaapi"), (False, "software")])
+async def test_diagnostics_reports_selected_encoder_after_preflight(ready, encoder):
+    hass = _hass()
+    hass.data[DOMAIN]["entryA"]["go2rtc"]._vaapi_enabled = ready
+    entry = _entry(options={"h264_cameras": [DEV], "h264_encoder": "vaapi"})
+    report, _ = await _diagnose(hass, entry)
+    assert report["cameras"]["camera_1"]["h264_encoder"] == encoder
