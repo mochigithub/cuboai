@@ -866,14 +866,8 @@ class Go2RTCManager:
             }
         domain_data["rtsp_port_effective"] = rtsp_port
         domain_data["api_port_effective"] = api_port
-        # HA's Stream object freezes the URL stream_source() returned when it
-        # was created and its worker retries THAT URL forever — reading
-        # rtsp_port_effective is not enough once a stream exists. Tell the
-        # cameras so they can repoint it (observed live: after an 8557 -> 8558
-        # hop the stream worker kept dialing 8557 for days).
-        from homeassistant.helpers.dispatcher import async_dispatcher_send
-
-        async_dispatcher_send(self.hass, ports_changed_signal(self._entry_id))
+        # The cameras are told about the new ports by start(), once the process
+        # is up — see _notify_ports_changed().
         await self._sync_webrtc_integration_url(api_port)
         return rtsp_port, webrtc_port
 
@@ -1148,6 +1142,26 @@ class Go2RTCManager:
         if self.process is not None:
             self._started_at = time.monotonic()
             self._start_watchdog()
+            self._notify_ports_changed()
+
+    def _notify_ports_changed(self) -> None:
+        """Tell the cameras to repoint their HA Stream at the ports we bound.
+
+        HA's Stream object freezes the URL stream_source() returned when it was
+        created and its worker retries THAT URL forever — reading
+        rtsp_port_effective is not enough once a stream exists (observed live:
+        after an 8557 -> 8558 hop the stream worker kept dialing 8557 for days).
+
+        Sent only once the process has survived its health check, never from
+        _resolve_ports(): the camera's repoint asks stream_source() for the new
+        URL, and stream_source() returns None while go2rtc is not running yet.
+        Sent from _resolve_ports() the repoint was a silent no-op after every
+        watchdog restart, and nothing ever retried it (seen live 2026-10-27:
+        a crash hopped 8557 -> 8558 and the worker kept dialing 8557).
+        """
+        from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+        async_dispatcher_send(self.hass, ports_changed_signal(self._entry_id))
 
     # ── watchdog ──────────────────────────────────────────────────────────────
 

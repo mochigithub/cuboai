@@ -18,7 +18,9 @@ Every test names the mutation it kills.
 """
 
 import asyncio
+import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -355,6 +357,88 @@ async def test_a_failed_start_arms_no_watchdog():
 
     assert m._watchdog_task is None
     assert m._started_at is None
+
+
+# =============================================================================
+# Repointing the cameras after a port hop
+# =============================================================================
+#
+# Observed live on 2026-10-27: go2rtc crashed, the watchdog restarted it, and
+# the RTSP port hopped 8557 -> 8558. The cameras were told about the new port
+# from _resolve_ports(), i.e. BEFORE the new process existed; their repoint
+# asks stream_source() for the URL, stream_source() returns None while go2rtc
+# is not running, so the repoint was a silent no-op and HA's stream worker kept
+# dialing 8557 until the integration was reloaded.
+
+
+def _start_patches(m, proc) -> ExitStack:
+    """Everything start() touches outside the manager, stubbed so it spawns `proc`."""
+    stack = ExitStack()
+    for p in (
+        patch.object(go2rtc_module.os.path, "exists", return_value=True),
+        patch.object(go2rtc_module.os, "chmod"),
+        patch.object(m, "_reclaim_stale_instance", AsyncMock()),
+        patch.object(m, "_own_last_ports", return_value=(None, None)),
+        patch.object(m, "_wait_for_port_free", AsyncMock()),
+        patch.object(m, "_resolve_ports", AsyncMock()),
+        patch.object(m, "_resolve_codecs", AsyncMock()),
+        patch.object(m, "_generate_config", AsyncMock()),
+        patch.object(go2rtc_module.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)),
+        patch.object(go2rtc_module.asyncio, "sleep", AsyncMock()),
+    ):
+        stack.enter_context(p)
+    return stack
+
+
+@pytest.mark.asyncio
+async def test_the_cameras_are_told_about_the_ports_once_go2rtc_is_running():
+    """Kill: the `_notify_ports_changed()` call in start() removed, or moved
+    back before the process is spawned."""
+    from custom_components.cuboai.const import ports_changed_signal
+
+    dispatcher = sys.modules["homeassistant.helpers.dispatcher"]
+
+    hass = _make_hass()
+    m = _manager(hass)
+    running_when_sent = []
+
+    def _record(_hass, signal):
+        if signal == ports_changed_signal("entryA"):
+            running_when_sent.append(m.is_running)
+
+    with _start_patches(m, _proc(pid=4242)), patch.object(dispatcher, "async_dispatcher_send", side_effect=_record):
+        await m.start()
+
+    m._cancel_watchdog()
+    assert running_when_sent == [True], "the cameras must hear about the ports once, with go2rtc already up"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_tells_the_cameras_nothing():
+    """A go2rtc that died in its health check has no ports to point at.
+
+    Kill: `_notify_ports_changed()` called outside the `if self.process is not
+    None` guard."""
+    dispatcher = sys.modules["homeassistant.helpers.dispatcher"]
+    hass = _make_hass()
+    m = _manager(hass)
+
+    with _start_patches(m, _proc(pid=4242, returncode=1)), patch.object(dispatcher, "async_dispatcher_send") as send:
+        await m.start()
+
+    assert m.process is None
+    send.assert_not_called()
+
+
+def test_resolve_ports_does_not_tell_the_cameras():
+    """Telling them from _resolve_ports() is exactly the 2026-10-27 bug: go2rtc
+    is not running yet there.
+
+    Kill: the dispatch re-added to _resolve_ports()."""
+    src = Path("custom_components/cuboai/go2rtc.py").read_text(encoding="utf-8")
+    body = src[src.index("async def _resolve_ports") : src.index("async def _sync_webrtc_integration_url")]
+    assert "async_dispatcher_send" not in body
+    assert "self._notify_ports_changed(" not in body
 
 
 # =============================================================================
